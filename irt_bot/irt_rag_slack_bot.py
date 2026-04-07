@@ -264,6 +264,18 @@ def _extract_field_with_ai(key: str, label: str, hint: str, message: str,
                 log.warning(f"_extract_field_with_ai (role-pattern): '{raw}' → '{val}'")
                 return val
 
+    # ── Special natural-language patterns for common fields ──────────────────
+    # e.g. "for this org trailtest01"  / "for org abc123"
+    if key == "org_id":
+        m = re.search(
+            r'(?i)\bfor\s+(?:this\s+)?org(?:anization|anisation|anization)?\s+([a-zA-Z0-9_\-\.]+)',
+            message
+        )
+        if m:
+            val = m.group(1).strip().rstrip(".,;")
+            log.warning(f"_extract_field_with_ai (org-natural): key={key} → '{val}'")
+            return val
+
     # Build alias list from the key
     key_aliases = {
         "org_id":        ["org_id", "orgid", "org", "organisation", "organization", "org id"],
@@ -292,13 +304,37 @@ def _extract_field_with_ai(key: str, label: str, hint: str, message: str,
             val = m.group(1).strip().rstrip(".,;")
             log.warning(f"_extract_field_with_ai (regex-email): key={key} alias='{alias}' → '{val}'")
             return val
-        # General pattern
-        pattern = rf"(?i)\b{re.escape(alias)}\s*[:\-=]\s*(\S+)"
+        # General pattern — supports : - = => ==> as separators
+        pattern = rf"(?i)\b{re.escape(alias)}\s*(?:==>|=>|[:\-=])\s*(\S+)"
         m = re.search(pattern, message)
         if m:
             val = m.group(1).strip().rstrip(".,;")
             log.warning(f"_extract_field_with_ai (regex): key={key} alias='{alias}' → '{val}'")
             return val
+
+    # ── Single-token shortcut: message is exactly one plain value ────────────
+    # Only fires when the ENTIRE message is a single token — no spaces, no newlines
+    stripped = message.strip().rstrip(".,;")
+    if ('\n' not in stripped and ' ' not in stripped
+            and re.match(r'^[a-zA-Z0-9_\-\.]+$', stripped)
+            and len(stripped) >= 3
+            and key not in ("role",)
+            and key not in ("old_email", "new_email")):
+
+        # Type validation — don't assign a date-like value to a non-date field
+        # and don't assign a non-date value to a date field
+        looks_like_date = bool(re.match(
+            r'^\d{1,4}[-/]\d{1,2}[-/]\d{2,4}$', stripped
+        ))
+        is_date_field = key in ("extend_period", "time_in_utc", "time_in_minutes")
+
+        if looks_like_date and not is_date_field:
+            log.warning(f"_extract_field_with_ai (single-token): SKIPPED — '{stripped}' looks like date but key={key}")
+        elif not looks_like_date and is_date_field:
+            log.warning(f"_extract_field_with_ai (single-token): SKIPPED — '{stripped}' not a date but key={key}")
+        else:
+            log.warning(f"_extract_field_with_ai (single-token): key={key} → '{stripped}'")
+            return stripped
 
     # ── Email position-based extraction ──────────────────────────────────────
     if key in ("old_email", "new_email"):
@@ -345,8 +381,23 @@ def _extract_field_with_ai(key: str, label: str, hint: str, message: str,
                 log.warning(f"_extract_field_with_ai (email-pos): key=new_email — no fresh email found")
                 return None
 
-    # ── GPT fallback ──────────────────────────────────────────────────────────
-    # Build field-specific instructions for better extraction
+    # ── Date extraction for extend_period / time fields ──────────────────────
+    if key in ("extend_period", "time_in_utc"):
+        # Match common date formats: YYYY-MM-DD, DD-MM-YYYY, D-MM-YYYY, YYYY/MM/DD
+        date_patterns = [
+            r'\b(\d{4}[-/]\d{1,2}[-/]\d{1,2})\b',   # YYYY-MM-DD
+            r'\b(\d{1,2}[-/]\d{1,2}[-/]\d{4})\b',   # DD-MM-YYYY or D-MM-YYYY
+        ]
+        for dp in date_patterns:
+            dm = re.search(dp, message)
+            if dm:
+                raw_date = dm.group(1)
+                # Normalise DD-MM-YYYY → YYYY-MM-DD
+                parts = re.split(r'[-/]', raw_date)
+                if len(parts) == 3 and len(parts[0]) != 4:
+                    raw_date = f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+                log.warning(f"_extract_field_with_ai (date-regex): key={key} → '{raw_date}'")
+                return raw_date
     extra_instructions = ""
     if key in ("old_email", "new_email"):
         pos = "first" if key == "old_email" else "second"
@@ -362,6 +413,14 @@ def _extract_field_with_ai(key: str, label: str, hint: str, message: str,
             f"\nThis is a role field. Valid values are ONLY 'admin' or 'user'.\n"
             f"Common typos to correct: 'uesr'→'user', 'usr'→'user', 'adimin'→'admin', 'adm'→'admin'.\n"
             f"Return exactly 'admin' or 'user' — nothing else."
+        )
+    elif key in ("extend_period", "time_in_utc"):
+        extra_instructions = (
+            f"\nThis is a date/datetime field. Look for any date-like value in the message.\n"
+            f"Accept formats like: YYYY-MM-DD, DD-MM-YYYY, D-MM-YYYY, YYYY/MM/DD, etc.\n"
+            f"Convert to YYYY-MM-DD format if possible. e.g. '2-04-2026' → '2026-04-02'.\n"
+            f"If multiple values in message, pick the one that looks like a date.\n"
+            f"Return ONLY the date value, nothing else."
         )
 
     resp = ai.chat.completions.create(
@@ -386,7 +445,18 @@ def _extract_field_with_ai(key: str, label: str, hint: str, message: str,
     )
     result = (resp.choices[0].message.content or "").strip()
     log.warning(f"_extract_field_with_ai (gpt): key={key} → '{result}'")
-    return None if (not result or result.upper() == "NOT_FOUND") else result
+    if not result or result.upper() == "NOT_FOUND":
+        return None
+    # Validate date fields — reject non-date values even if GPT returns something
+    if key in ("extend_period", "time_in_utc"):
+        date_valid = bool(re.match(r'^\d{1,4}[-/]\d{1,2}[-/]\d{2,4}$', result.strip()))
+        if not date_valid:
+            log.warning(
+                f"_extract_field_with_ai (gpt-date-reject): key={key} "
+                f"value='{result}' is not a valid date format → None"
+            )
+            return None
+    return result
 
 
 def _extract_all_fields_from_message(category_def: dict, message: str) -> dict:
@@ -396,9 +466,12 @@ def _extract_all_fields_from_message(category_def: dict, message: str) -> dict:
     """
     collected = {}
     for field in category_def.get("fields", []):
+        # Skip fields marked no_pre_extract — they need user input or button selection
+        if field.get("no_pre_extract"):
+            continue
         value = _extract_field_with_ai(
             field["key"], field["label"], field["hint"], message,
-            already_collected=collected  # ← pass what's been collected so far
+            already_collected=collected
         )
         if value:
             collected[field["key"]] = value
@@ -419,7 +492,15 @@ def _is_field_required(field: dict, collected: dict) -> bool:
     """
     Determines if a field is required given the current collected values.
     Handles conditional required_when logic.
+    A field with default_when that matches is NOT required — default will be applied.
     """
+    # If this field has a default_when condition and it matches, skip it
+    default_when = field.get("default_when", {})
+    if default_when:
+        cond_key = next((k for k in default_when if k != "default"), None)
+        if cond_key and collected.get(cond_key) == default_when.get(cond_key):
+            return False  # default will be applied — not required from user
+
     if field.get("required"):
         return True
     if "required_when" in field:
@@ -432,34 +513,66 @@ def _is_field_required(field: dict, collected: dict) -> bool:
 def _build_payload(category_def: dict, collected: dict) -> dict:
     """
     Constructs the API payload from collected field values.
-    Handles transforms (to_int, yes_no_to_bool, split_by_comma, special cases).
     """
     transforms = category_def.get("payload_transform", {})
     template   = category_def.get("payload_template", {})
 
-    # Special case: Admin Email Changes — send all provided fields
+    # Apply defaults for optional fields not provided, skip __skip__ placeholders
+    for field in category_def.get("fields", []):
+        k = field["key"]
+        if collected.get(k) == "__skip__":
+            del collected[k]  # remove placeholder before building payload
+        elif k not in collected and "default" in field:
+            collected[k] = field["default"]
+
+    # Special case: Admin Email changes — dynamic payload
     if template == "dynamic_all_provided":
         payload = {}
+        missing_required = []
         for field in category_def.get("fields", []):
             k = field["key"]
             v = collected.get(k)
+            is_req = _is_field_required(field, collected)
             if v:
                 payload[k] = v
+            elif is_req:
+                missing_required.append(k)
+        if missing_required:
+            raise ValueError(f"Required fields missing from payload: {missing_required}")
+        log.warning(f"[AUTO] PAYLOAD BUILT (dynamic) — keys={list(payload.keys())} values={payload}")
         return payload
 
-    # Special case: Activate Dataset — nested schema structure
-    if category_def["category"] == "Activate Dataset":
-        activate_type = collected.get("activate_type", "current_schema")
-        return {
+    # Special case: Activate Dataset — handle v1 vs v2
+    if template == "custom_activate_dataset":
+        dataset_version = collected.get("dataset_version", "v1")
+        activate_type   = collected.get("activate_type", "current_schema")
+        schema_id       = collected.get("schema_to_activate", "")
+
+        if dataset_version == "v2":
+            # v2: use current_schema by default, no schema_to_activate needed
+            schema_payload = {
+                "activate_current_schema":     True,
+                "activate_in_progress_schema": False,
+                "activate_backup_schema":      False,
+            }
+        else:
+            # v1: use provided schema_id and activate_type
+            schema_payload = {
+                "schema_to_activate":          schema_id,
+                "activate_current_schema":     activate_type == "current_schema",
+                "activate_in_progress_schema": activate_type == "in_progress_schema",
+                "activate_backup_schema":      activate_type == "backup_schema",
+            }
+
+        result = {
             "dataset_id": collected["dataset_id"],
             "org_id":     collected["org_id"],
-            "schema": {
-                "schema_to_activate": collected["schema_to_activate"],
-                f"activate_{activate_type}": True,
-            }
+            "schema":     schema_payload,
         }
+        log.warning(f"[AUTO] PAYLOAD BUILT (activate_dataset v{dataset_version}) — {result}")
+        return result
 
-    # General case: substitute from template
+    # General case
     def _transform(key, val):
         t = transforms.get(key, "")
         if t == "to_int":
@@ -468,7 +581,7 @@ def _build_payload(category_def: dict, collected: dict) -> dict:
             except Exception:
                 return val
         if t == "yes_no_to_bool":
-            return str(val).lower().strip() in ("yes", "true", "1", "y")
+            return str(val).lower().strip() in ("yes", "true", "1", "y", "true")
         if t == "split_by_comma":
             return [v.strip() for v in str(val).split(",") if v.strip()]
         return val
@@ -488,7 +601,16 @@ def _build_payload(category_def: dict, collected: dict) -> dict:
 def call_automation_api(category: str, details: dict) -> dict:
     """Calls the IRT Automation API using requests library. Returns {ok, message}."""
     import requests as req_lib
-    payload = json.dumps({"config": {"category": category, "details": details}})
+    payload_str = json.dumps({"config": {"category": category, "details": details}})
+
+    log.warning(
+        f"[API] REQUEST ───────────────────────────────\n"
+        f"  URL      : {AUTOMATION_API_URL}\n"
+        f"  Category : {category}\n"
+        f"  Payload  : {payload_str[:500]}\n"
+        f"────────────────────────────────────────────"
+    )
+
     headers = {
         "Content-Type":  "application/json",
         "Authorization": f"Bearer {AUTOMATION_TOKEN}",
@@ -497,16 +619,27 @@ def call_automation_api(category: str, details: dict) -> dict:
         resp = req_lib.post(
             AUTOMATION_API_URL,
             headers = headers,
-            data    = payload,
+            data    = payload_str,
             timeout = 30,
         )
-        log.warning(f"automation API status={resp.status_code} response={resp.text[:200]}")
+        log.warning(
+            f"[API] RESPONSE ──────────────────────────────\n"
+            f"  Status   : {resp.status_code}\n"
+            f"  Body     : {resp.text[:500]}\n"
+            f"────────────────────────────────────────────"
+        )
         if resp.status_code == 200:
             return {"ok": True, "message": resp.text[:300]}
         else:
             return {"ok": False, "message": f"API error {resp.status_code}: {resp.text[:200]}"}
     except Exception as e:
-        log.error(f"automation API error: {e}")
+        log.error(
+            f"[API] ERROR ─────────────────────────────────\n"
+            f"  URL      : {AUTOMATION_API_URL}\n"
+            f"  Category : {category}\n"
+            f"  Error    : {e}\n"
+            f"────────────────────────────────────────────"
+        )
         return {"ok": False, "message": str(e)[:200]}
 
 
@@ -604,16 +737,39 @@ def automation_agent(user: str, channel: str, message: str, category_def: dict =
             if f["key"] not in collected and _is_field_required(f, collected)
         ]
         if missing_now:
+            # A single bare token (no spaces, no separators) is a direct answer
+            # to the FIRST missing field only — never spread it across multiple fields.
+            _stripped_msg = message.strip()
+            is_single_token_reply = (
+                ' ' not in _stripped_msg
+                and '\n' not in _stripped_msg
+                and ':' not in _stripped_msg
+                and '=' not in _stripped_msg
+                and '{' not in _stripped_msg
+                and len(_stripped_msg) >= 2
+            )
+
             # Try to extract every missing field from this single message
             extracted_any = False
             for field in missing_now:
+                # Skip ONLY button/enum fields — they must be set via button clicks
+                # no_pre_extract only blocks trigger-message extraction, not follow-up replies
+                if field.get("use_buttons"):
+                    continue
                 extracted = _extract_field_with_ai(
                     field["key"], field["label"], field["hint"], message,
-                    already_collected=collected  # ← pass context so emails aren't reused
+                    already_collected=collected
                 )
                 if extracted:
                     collected[field["key"]] = extracted
                     extracted_any = True
+                    if is_single_token_reply:
+                        # Single bare value → belongs to this field only; stop here
+                        log.warning(
+                            f"[AUTO] SINGLE-TOKEN STOP — assigned '{extracted}' "
+                            f"to '{field['key']}' only (skipping remaining fields)"
+                        )
+                        break
 
             # Email dedup: if both emails extracted and they're the same,
             # only one email was given — keep old, re-ask for new
@@ -651,6 +807,21 @@ def automation_agent(user: str, channel: str, message: str, category_def: dict =
                     break
 
     state.pop("just_started", None)
+    # ── Apply default_when values for any field whose condition is now met ────
+    for field in fields:
+        default_when = field.get("default_when", {})
+        if default_when and field["key"] not in collected:
+            cond_key = next((k for k in default_when if k != "default"), None)
+            if cond_key and collected.get(cond_key) == default_when.get(cond_key):
+                default_val = default_when.get("default", "")
+                if default_val != "":
+                    collected[field["key"]] = default_val
+                    log.warning(f"[AUTO] DEFAULT APPLIED — field={field['key']} value='{default_val}' (because {cond_key}={collected[cond_key]})")
+                elif default_val == "":
+                    # Explicitly set empty string default (skip this field entirely)
+                    collected[field["key"]] = "__skip__"
+                    log.warning(f"[AUTO] DEFAULT SKIP — field={field['key']} (v2 default)")
+    state["collected"] = collected
     _set_auto_state(user, channel, state)
 
     # ── Find missing required fields ──────────────────────────────────────────
@@ -662,45 +833,68 @@ def automation_agent(user: str, channel: str, message: str, category_def: dict =
     if missing:
         _set_auto_state(user, channel, state)
 
-        # Show already collected fields as context
+        # Build collected context lines
         collected_lines = ""
         if collected:
             lines = []
             for f in fields:
-                if f["key"] in collected:
-                    lines.append(f"   ✅ *{f['label']}:* `{collected[f['key']]}`")
-            collected_lines = "\n".join(lines) + "\n\n"
+                if f["key"] not in collected:
+                    continue
+                val = collected[f["key"]]
+                # Hide internal fields from user-facing display
+                if val == "__skip__" or f["key"] == "dataset_version":
+                    continue
+                enum_vals   = f.get("enum_values", [])
+                enum_labels = f.get("enum_labels", enum_vals)
+                if val in enum_vals:
+                    idx     = enum_vals.index(val)
+                    display = enum_labels[idx] if idx < len(enum_labels) else val
+                else:
+                    display = f"`{val}`"
+                lines.append(f"   ✅ *{f['label']}:* {display}")
+            collected_lines = "\n".join(lines) + "\n\n" if lines else ""
 
-        # Ask ALL missing fields at once — numbered list
-        missing_lines = []
-        for i, f in enumerate(missing, 1):
-            missing_lines.append(f"   *{i}. {f['label']}*\n   _{f['hint']}_")
-        missing_text = "\n\n".join(missing_lines)
+        next_field = missing[0]
+        after_note = ""
+        if len(missing) > 1:
+            remaining  = ", ".join(f"*{f['label']}*" for f in missing[1:])
+            after_note = f"\n\n_After that I'll also need: {remaining}_"
 
-        intro = "📝 *Please provide the following details:*" if len(missing) > 1 else f"📝 Please provide *{missing[0]['label']}*"
+        # ── Enum field with buttons ───────────────────────────────────────────
+        if next_field.get("use_buttons") and next_field.get("enum_values"):
+            return f"__ENUM_FIELD__:{json.dumps({'field': next_field, 'collected_lines': collected_lines, 'after_note': after_note})}"
 
-        # If extraction failed multiple times, show a clearer hint
+        # ── Regular text field — use question from JSON ───────────────────────
         failed_count = state.get("_failed_extractions", 0)
-        retry_hint = ""
+        retry_hint   = ""
         if failed_count >= 2:
-            retry_hint = (
-                f"\n\n⚠️ _I'm having trouble reading your input. "
-                f"Please paste the value directly, e.g.:_ `{missing[0]['hint']}`"
-            )
+            retry_hint = f"\n\n⚠️ _Please paste the value directly, e.g.:_ `{next_field['hint']}`"
 
+        question = next_field.get("question", f"Please provide *{next_field['label']}*\n_{next_field['hint']}_")
         return (
             f"{collected_lines}"
-            f"{intro}\n\n"
-            f"{missing_text}"
-            f"{retry_hint}\n\n"
-            f"_You can provide all of them in one message or one at a time._"
+            f"📝 {question}"
+            f"{after_note}"
+            f"{retry_hint}"
         )
 
     # ── All fields collected → show confirmation with buttons ─────────────────
     summary_lines = []
     for f in fields:
-        if f["key"] in collected:
-            summary_lines.append(f"   *{f['label']}:* `{collected[f['key']]}`")
+        if f["key"] not in collected:
+            continue
+        val = collected[f["key"]]
+        # Hide internal-only fields and skipped defaults from the summary
+        if val == "__skip__" or f["key"] == "dataset_version":
+            continue
+        enum_vals   = f.get("enum_values", [])
+        enum_labels = f.get("enum_labels", enum_vals)
+        if val in enum_vals:
+            idx     = enum_vals.index(val)
+            display = enum_labels[idx] if idx < len(enum_labels) else val
+        else:
+            display = f"`{val}`"
+        summary_lines.append(f"   *{f['label']}:* {display}")
     summary = "\n".join(summary_lines)
 
     state["awaiting_confirm"] = True
@@ -709,7 +903,6 @@ def automation_agent(user: str, channel: str, message: str, category_def: dict =
         f"[AUTO] READY TO CONFIRM — user={user} category={cat_def['category']} "
         f"fields={list(collected.keys())}"
     )
-    # Return special marker so caller renders confirm/cancel buttons
     return "__CONFIRM__:" + f"🔧 *Ready to execute: {cat_def['category']}*\n\n{summary}"
 
 
@@ -742,7 +935,34 @@ def confirm_action_blocks(summary_text: str) -> list:
     ]
 
 
-def automation_info_response(category_def: dict) -> str:
+def enum_field_blocks(field: dict, collected_lines: str = "") -> list:
+    """
+    Builds a Slack block with buttons for an enum field.
+    Used when field has use_buttons=True.
+    """
+    question   = field.get("question", f"Please select *{field['label']}*")
+    values     = field.get("enum_values", [])
+    labels     = field.get("enum_labels", values)
+    field_key  = field["key"]
+
+    blocks = []
+    if collected_lines:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": collected_lines.rstrip()}})
+
+    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"📝 {question}"}})
+
+    if values:
+        buttons = []
+        for val, lbl in zip(values, labels):
+            buttons.append({
+                "type": "button",
+                "text": {"type": "plain_text", "text": str(lbl), "emoji": True},
+                "action_id": f"auto_enum_{field_key}_{val}",
+                "value": val,
+            })
+        blocks.append({"type": "actions", "elements": buttons[:5]})
+
+    return blocks
     """
     Returns a Slack message describing the required inputs for a category.
     Built directly from the category_def payload — always accurate.
@@ -1419,13 +1639,31 @@ def create_slack_list_ticket(state: dict, client) -> str:
 def _resolve_auto_response(response: str) -> tuple:
     """
     automation_agent() returns either:
-      - A plain string  → wrap in step_block
-      - "__CONFIRM__:..." → render confirm/cancel buttons
+      - A plain string         → wrap in step_block
+      - "__CONFIRM__:..."      → render confirm/cancel buttons
+      - "__ENUM_FIELD__:..."   → render enum buttons for field selection
     Returns (text, blocks).
     """
     if isinstance(response, str) and response.startswith("__CONFIRM__:"):
         body = response[len("__CONFIRM__:"):]
         return body, confirm_action_blocks(body)
+
+    if isinstance(response, str) and response.startswith("__ENUM_FIELD__:"):
+        raw  = response[len("__ENUM_FIELD__:"):]
+        try:
+            data           = json.loads(raw)
+            field          = data["field"]
+            collected_lines = data.get("collected_lines", "")
+            after_note     = data.get("after_note", "")
+            blocks         = enum_field_blocks(field, collected_lines)
+            if after_note:
+                blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": after_note}]})
+            text = f"📝 {field.get('question', field['label'])}"
+            return text, blocks
+        except Exception as e:
+            log.error(f"_resolve_auto_response ENUM_FIELD parse error: {e}")
+            return response, step_block(response)
+
     return response, step_block(response)
 
 
@@ -1522,6 +1760,9 @@ def stream_response(
             elif decision["action"] == "clarify":
                 clarification = decision["text"]
                 suggestions   = decision.get("suggestions", [])
+                # Auto-add v1/v2 buttons when asking about version
+                if not suggestions and "v1" in clarification.lower() and "v2" in clarification.lower():
+                    suggestions = ["v1", "v2"]
                 if user_id:
                     _add_history(user_id, history_channel, "user", query)
                     _add_history(user_id, history_channel, "assistant", f"🤔 {clarification}")
@@ -1683,16 +1924,20 @@ def stream_response(
         elif decision["action"] == "clarify":
             clarification = decision["text"]
             suggestions   = decision.get("suggestions", [])
+            # Auto-add v1/v2 buttons when asking about version
+            if not suggestions and "v1" in clarification.lower() and "v2" in clarification.lower():
+                suggestions = ["v1", "v2"]
             stop_flag["done"] = True
             anim.join(timeout=1)
             is_pure_dm = channel.startswith("D")
 
-            if is_pure_dm:
+            if is_pure_dm or not thread_ts:
+                # DMs and group DMs (no thread context) — post inline, no anchor in main channel
                 try:
                     client.chat_delete(channel=channel, ts=msg_ts)
                 except Exception:
                     pass
-                client.chat_postMessage(
+                sent = client.chat_postMessage(
                     channel=channel,
                     text=f"🤔 {clarification}",
                     blocks=clarify_blocks(clarification, suggestions),
@@ -1700,37 +1945,25 @@ def stream_response(
                 if user_id:
                     _add_history(user_id, history_channel, "user", query)
                     _add_history(user_id, history_channel, "assistant", f"🤔 {clarification}")
+                    _save_pending(ts=sent["ts"], query=query, user=user_id, channel=channel)
             else:
-                if thread_ts:
-                    anchor_ts = thread_ts
-                    try:
-                        client.chat_delete(channel=channel, ts=msg_ts)
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        client.chat_delete(channel=channel, ts=msg_ts)
-                    except Exception:
-                        pass
-                    anchor = client.chat_postMessage(
-                        channel=channel, text=f"*Question:* {query}",
-                        blocks=[{"type": "section",
-                            "text": {"type": "mrkdwn", "text": f"*Question:* {query}"}}]
-                    )
-                    anchor_ts = anchor["ts"]
-
+                # Channel thread (thread_ts already set) — reply inside existing thread, no new anchor
+                try:
+                    client.chat_delete(channel=channel, ts=msg_ts)
+                except Exception:
+                    pass
                 sent = client.chat_postMessage(
                     channel=channel, text=f"🤔 {clarification}",
                     blocks=clarify_blocks(clarification, suggestions),
-                    thread_ts=anchor_ts,
+                    thread_ts=thread_ts,
                 )
                 if user_id:
                     _save_pending(ts=sent["ts"],   query=query, user=user_id, channel=channel)
-                    _save_pending(ts=anchor_ts,    query=query, user=user_id, channel=channel)
+                    _save_pending(ts=thread_ts,    query=query, user=user_id, channel=channel)
                     _pending[sent["ts"]]["clarify_ts"] = sent["ts"]
-                    _pending[anchor_ts]["clarify_ts"]  = sent["ts"]
-                    _pending[sent["ts"]]["anchor_ts"]  = anchor_ts
-                    _pending[anchor_ts]["anchor_ts"]   = anchor_ts
+                    _pending[thread_ts]["clarify_ts"]  = sent["ts"]
+                    _pending[sent["ts"]]["anchor_ts"]  = thread_ts
+                    _pending[thread_ts]["anchor_ts"]   = thread_ts
             return
 
         else:  # search
@@ -1880,18 +2113,22 @@ def handle_clarify_reply(ack, body, client):
     channel   = body["channel"]["id"]
     value     = body["actions"][0]["value"]
     msg_ts    = body["message"]["ts"]
-    thread_ts = body["message"].get("thread_ts", msg_ts)
+    thread_ts = body["message"].get("thread_ts")
 
-    pending = _get_pending(msg_ts) or _get_pending(thread_ts)
+    pending = _get_pending(msg_ts) or _get_pending(thread_ts or msg_ts)
     if pending:
         _clear_pending(msg_ts)
-        _clear_pending(thread_ts)
+        _clear_pending(thread_ts or msg_ts)
         search_input = build_enriched_query(pending["query"], value)
     else:
         search_input = value
 
+    # If the clarification was posted inline (no real thread_ts), reply inline too.
+    # Only use thread_ts when it refers to a different (parent) message.
+    effective_thread_ts = thread_ts if (thread_ts and thread_ts != msg_ts) else None
+
     threading.Thread(target=stream_response, args=(client, channel, search_input),
-        kwargs={"thread_ts": thread_ts, "user_id": user}, daemon=True).start()
+        kwargs={"thread_ts": effective_thread_ts, "user_id": user}, daemon=True).start()
 
 
 @app.action("ask_another")
@@ -1910,6 +2147,79 @@ def handle_create_ticket(ack):
     ack()
 
 
+@app.action(re.compile(r"auto_enum_.+"))
+def handle_auto_enum_button(ack, body, client):
+    """User clicked an enum option button (role, activate_type, etc.)."""
+    ack()
+    user      = body["user"]["id"]
+    channel   = body["channel"]["id"]
+    msg_ts    = body["message"]["ts"]
+    thread_ts = body["message"].get("thread_ts", msg_ts)
+    value     = body["actions"][0]["value"]
+
+    auto_state = _get_auto_state(user, channel)
+    if not auto_state or auto_state.get("closed"):
+        try:
+            client.chat_postEphemeral(channel=channel, user=user,
+                text="⚠️ This thread is closed. Start a new request by mentioning @irtbot.")
+        except Exception:
+            pass
+        return
+
+    cat_def   = auto_state["category_def"]
+    collected = auto_state["collected"]
+    field_key = None
+
+    # Find the next missing enum field that accepts this value
+    for field in cat_def.get("fields", []):
+        if (field.get("use_buttons")
+                and value in field.get("enum_values", [])
+                and field["key"] not in collected
+                and _is_field_required(field, collected)):
+            field_key = field["key"]
+            break
+
+    if not field_key:
+        log.warning(f"handle_auto_enum_button: no matching field for value='{value}'")
+        return
+
+    # Save selected value
+    collected[field_key]    = value
+    auto_state["collected"] = collected
+    auto_state["_failed_extractions"] = 0
+    _set_auto_state(user, channel, auto_state)
+    log.warning(f"[AUTO] ENUM SELECTED — user={user} field={field_key} value={value}")
+
+    # Update the button message to show the selection clearly
+    field_def   = next((f for f in cat_def["fields"] if f["key"] == field_key), {})
+    enum_vals   = field_def.get("enum_values", [])
+    enum_labels = field_def.get("enum_labels", enum_vals)
+    display     = enum_labels[enum_vals.index(value)] if value in enum_vals else value
+    try:
+        client.chat_update(
+            channel = channel, ts = msg_ts,
+            text    = f"✅ *{field_def.get('label', field_key)}:* {display}",
+            blocks  = [{"type": "section", "text": {"type": "mrkdwn",
+                "text": f"✅ *{field_def.get('label', field_key)}:* {display}"
+            }}]
+        )
+    except Exception:
+        pass
+
+    # Continue agent — get next field or show confirm
+    def _continue():
+        response = automation_agent(user, channel, value)
+        final_text, final_blocks = _resolve_auto_response(response)
+        t_state = _get_auto_state(user, channel)
+        t_ts    = (t_state or {}).get("thread_ts") or thread_ts
+        kw      = {"channel": channel, "text": final_text, "blocks": final_blocks}
+        if t_ts:
+            kw["thread_ts"] = t_ts
+        client.chat_postMessage(**kw)
+
+    threading.Thread(target=_continue, daemon=True).start()
+
+
 @app.action("automation_confirm")
 def handle_automation_confirm(ack, body, client):
     """User clicked the ✅ Confirm button on the automation summary card."""
@@ -1919,9 +2229,24 @@ def handle_automation_confirm(ack, body, client):
     msg_ts    = body["message"]["ts"]
     thread_ts = body["message"].get("thread_ts", msg_ts)
 
-    # Get the category name from active state for a meaningful message
+    # ── Issue 4 fix: block confirm if thread is already closed ───────────────
     auto_state = _get_auto_state(user, channel)
-    category   = (auto_state or {}).get("category_def", {}).get("category", "Automation")
+    if not auto_state or auto_state.get("closed"):
+        try:
+            client.chat_update(
+                channel = channel, ts = msg_ts,
+                text    = "⚠️ This thread has been closed. The automation was not executed.",
+                blocks  = [{"type": "section", "text": {"type": "mrkdwn",
+                    "text": "⚠️ *This thread has been closed.* The automation was not executed.\n_Start a new request by mentioning @irtbot._"
+                }}]
+            )
+        except Exception:
+            pass
+        log.warning(f"[AUTO] CONFIRM BLOCKED — thread closed — user={user}")
+        return
+
+    # Get the category name from active state (already fetched above)
+    category = auto_state.get("category_def", {}).get("category", "Automation")
 
     # Replace buttons immediately with an "executing" message
     executing_text = (
@@ -1944,8 +2269,12 @@ def handle_automation_confirm(ack, body, client):
     def _execute():
         response = automation_agent(user, channel, "confirm")
         final_text, final_blocks = _resolve_auto_response(response)
+
         if "completed successfully" in final_text:
-            log.warning(f"automation_confirm: completed — user={user} category={category}")
+            log.warning(f"[AUTO] API SUCCESS — user={user} category={category}")
+        elif "failed" in final_text.lower():
+            log.warning(f"[AUTO] API FAILED — user={user} category={category}")
+
         # Replace the executing message with the final result
         try:
             client.chat_update(channel=channel, ts=msg_ts,
@@ -2252,25 +2581,26 @@ def welcome_blocks(user: str) -> list:
     Rich welcome card shown when someone @mentions the bot with no query,
     or says hi/hello. Shows what the bot can do with example prompts.
     """
-    # Dynamically fetch automation category names from KB for the examples
-    auto_examples = [
+    # Dynamically fetch ALL automation category names from KB
+    auto_names = [
         "Extend Trial Period", "Activate Dataset",
         "Enable Athena IQ", "Increase User Count",
+        "Update Refresh Time", "Admin Email Changes",
+        "Enable Athena Threads", "Increase User Count",
+        "Remove SME Duplicates", "Get Entity Count",
     ]
     try:
         if auto_count > 0:
             all_cats = qclient.scroll(
                 collection_name=AUTO_COLLECTION, limit=50, with_payload=True
             )[0]
-            names = [p.payload.get("category", "") for p in all_cats if p.payload.get("category")]
-            if names:
-                auto_examples = names[:4]
+            fetched = [p.payload.get("category", "") for p in all_cats if p.payload.get("category")]
+            if fetched:
+                auto_names = fetched
     except Exception:
         pass
 
-    auto_list = "\n".join(f"   • {c}" for c in auto_examples)
-    if auto_count > len(auto_examples):
-        auto_list += f"\n   _...and {auto_count - len(auto_examples)} more_"
+    auto_list = "\n".join(f"   • {c}" for c in auto_names)
 
     return [
         # ── Header ────────────────────────────────────────────────────────────
@@ -2327,12 +2657,6 @@ def welcome_blocks(user: str) -> list:
                     "   `@irtbot extend trial period for org_123`\n"
                     "   `@irtbot activate dataset ds_456`"
                 )
-            },
-            "accessory": {
-                "type": "button",
-                "text": {"type": "plain_text", "text": "See all automations", "emoji": True},
-                "action_id": "show_all_automations",
-                "value": "show_all",
             }
         },
 
@@ -2380,7 +2704,21 @@ _GREETING_PHRASES = {
 
 def _is_greeting(text: str) -> bool:
     q = text.lower().strip().rstrip("!?.,")
-    return q in _GREETING_PHRASES or len(text.split()) <= 2
+    if q in _GREETING_PHRASES:
+        return True
+    # Only treat very short messages as greetings if they don't contain
+    # any action verbs that suggest an automation or search intent
+    action_verbs = [
+        "extend", "increase", "change", "enable", "activate", "remove",
+        "update", "get", "disable", "set", "add", "delete",
+        "provide", "fetch", "show", "give", "find", "check",
+        "count", "dataset", "trial", "refresh", "entity", "sme",
+        "email", "athena", "connector", "session", "timeout", "schema",
+        "create", "ticket", "raise", "log",
+    ]
+    if any(v in q for v in action_verbs):
+        return False
+    return len(text.split()) <= 2
 
 
 def _open_thread_warning(user: str, channel: str, client) -> bool:
